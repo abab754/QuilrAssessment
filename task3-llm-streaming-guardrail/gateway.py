@@ -1,5 +1,6 @@
 import json
 import logging
+import re
 import sys
 
 import httpx
@@ -38,22 +39,83 @@ def wrap_as_sse(text: str) -> str:
     return f"data: {json.dumps(data)}\n\n"
 
 
-async def stream_with_redaction(upstream_response: httpx.Response):
-    """Read SSE chunks from upstream, and stream them back to the client.
+PII_PATTERNS = [
+    # Email: word chars, dots, pluses, hyphens @ domain
+    re.compile(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}"),
+    # SSN: 3-2-4 digits with hyphens or spaces
+    re.compile(r"\b\d{3}[-\s]\d{2}[-\s]\d{4}\b"),
+    # Credit card: 13-19 digits with optional hyphens or spaces
+    re.compile(r"\b(?:\d[-\s]?){13,19}\b"),
+]
 
-    TODO: step 4 will add PII redaction in the middle.
+# Characters that could be part of an in-progress PII pattern.
+# If the buffer ends with any of these, we hold it back in case
+# the next chunk completes a match.
+PARTIAL_CHARS = re.compile(r"[a-zA-Z0-9._%+@-]+$")
+
+
+class PIIRedactor:
+    """Streaming PII redactor that handles patterns split across chunks.
+
+    Maintains a buffer of text that might be part of an incomplete PII pattern.
+    Flushes safe text immediately and holds back trailing characters that could
+    be the start of a match.
     """
+
+    def __init__(self):
+        self.buffer = ""
+
+    def feed(self, text: str) -> str:
+        """Add new text. Returns the portion that is safe to emit."""
+        self.buffer += text
+        # Redact any complete PII matches in the buffer
+        self.buffer = self._redact(self.buffer)
+
+        # Find trailing text that could be a partial PII match.
+        # Hold it back; flush everything before it.
+        match = PARTIAL_CHARS.search(self.buffer)
+        if match and match.end() == len(self.buffer):
+            safe = self.buffer[: match.start()]
+            self.buffer = self.buffer[match.start():]
+            return safe
+
+        # No partial match at the end — flush everything
+        safe = self.buffer
+        self.buffer = ""
+        return safe
+
+    def flush(self) -> str:
+        """Flush remaining buffer (end of stream). Redact anything left."""
+        remaining = self._redact(self.buffer)
+        self.buffer = ""
+        return remaining
+
+    def _redact(self, text: str) -> str:
+        for pattern in PII_PATTERNS:
+            text = pattern.sub("[REDACTED]", text)
+        return text
+
+
+async def stream_with_redaction(upstream_response: httpx.Response):
+    """Read SSE chunks from upstream, redact PII, and stream back."""
+    redactor = PIIRedactor()
+
     async for line in upstream_response.aiter_lines():
         if not line:
             continue
 
         text = extract_text_from_sse(line)
         if text is not None:
-            yield wrap_as_sse(text)
+            safe = redactor.feed(text)
+            if safe:
+                yield wrap_as_sse(safe)
         elif line.startswith("data: [DONE]"):
+            # Flush any remaining buffered text before closing
+            remaining = redactor.flush()
+            if remaining:
+                yield wrap_as_sse(remaining)
             yield "data: [DONE]\n\n"
         else:
-            # Pass through non-content SSE lines (e.g. finish_reason)
             yield f"{line}\n\n"
 
 
