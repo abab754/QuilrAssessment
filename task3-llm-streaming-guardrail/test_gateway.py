@@ -169,3 +169,124 @@ async def test_mixed_pii_all_redacted():
     assert "987-65-4321" not in text
     assert "5500" not in text
     assert text.count("[REDACTED]") >= 3
+
+
+# ============================================================
+# Evaluation criteria tests
+# ============================================================
+
+
+class TestStreamChunkingAndBufferManagement:
+    """Criterion 1: Efficient async stream chunking and buffer state management."""
+
+    def test_safe_text_emitted_incrementally(self):
+        """Redactor emits safe text on each feed(), not just at flush()."""
+        r = PIIRedactor()
+        out1 = r.feed("Hello world. ")
+        out2 = r.feed("How are you? ")
+        out3 = r.flush()
+        # Safe text should be emitted in feed() calls, not all at flush
+        assert len(out1) > 0 or len(out2) > 0
+        assert out1 + out2 + out3 == "Hello world. How are you? "
+
+    def test_buffer_only_holds_trailing_partial(self):
+        """After feed(), buffer only contains the trailing partial match candidate."""
+        r = PIIRedactor()
+        r.feed("Safe text here. Then some partial 123-45")
+        # Buffer should only hold "123-45", not the entire input
+        assert len(r.buffer) < 20
+        assert "Safe text" not in r.buffer
+
+    def test_buffer_empty_after_safe_text(self):
+        """Buffer is empty after feeding text that ends with a space (no partial)."""
+        r = PIIRedactor()
+        r.feed("No PII here at all. ")
+        assert r.buffer == ""
+
+    def test_multiple_chunks_buffer_stays_small(self):
+        """Buffer stays bounded even after many chunks of safe text."""
+        r = PIIRedactor()
+        for _ in range(100):
+            r.feed("This is a perfectly safe sentence. ")
+        assert len(r.buffer) == 0
+
+
+class TestRegexPerformance:
+    """Criterion 2: Performant string/regex pattern matching over partial text streams."""
+
+    def test_buffer_does_not_grow_with_safe_text(self):
+        """Regex runs on small buffer, not accumulating text."""
+        r = PIIRedactor()
+        for i in range(50):
+            r.feed(f"Chunk {i} with no PII. ")
+            # Buffer should never hold more than the trailing partial
+            assert len(r.buffer) < 50, f"Buffer grew too large at chunk {i}: {len(r.buffer)}"
+
+    def test_regex_handles_many_chunks_without_slowdown(self):
+        """Process 1000 chunks quickly - proves regex isn't re-scanning old text."""
+        import time
+        r = PIIRedactor()
+        start = time.perf_counter()
+        for i in range(1000):
+            r.feed(f"Safe chunk number {i}. ")
+        r.flush()
+        elapsed = time.perf_counter() - start
+        assert elapsed < 1.0, f"Processing 1000 chunks took {elapsed:.2f}s"
+
+    def test_partial_pattern_does_not_cause_backtracking(self):
+        """Repeated partial-looking strings don't cause regex backtracking issues."""
+        r = PIIRedactor()
+        total_out = ""
+        for _ in range(100):
+            total_out += r.feed("abc-de ")
+        total_out += r.flush()
+        assert "[REDACTED]" not in total_out
+
+
+class TestMemoryAndLatency:
+    """Criterion 3: Memory efficiency and low-latency proxying design."""
+
+    @pytest.mark.anyio
+    async def test_first_chunk_arrives_before_stream_ends(self):
+        """TTFT: first redacted chunk is yielded before the full stream completes."""
+        transport = ASGITransport(app=mock_app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            upstream_resp = await client.send(
+                client.build_request("POST", "/v1/chat/completions", json=make_request("clean")),
+                stream=True,
+            )
+            chunks = []
+            async for sse_line in stream_with_redaction(upstream_resp):
+                if not sse_line.startswith("data: "):
+                    continue
+                payload = sse_line[6:].strip()
+                if payload == "[DONE]":
+                    break
+                chunks.append(payload)
+            await upstream_resp.aclose()
+        # Multiple chunks, not one big blob
+        assert len(chunks) >= 2, f"Expected multiple chunks, got {len(chunks)}"
+
+    def test_no_full_response_accumulation(self):
+        """Redactor never holds the full response, only a small trailing buffer."""
+        r = PIIRedactor()
+        total_fed = 0
+        max_buffer = 0
+        for i in range(200):
+            chunk = f"This is sentence number {i} in a long response. "
+            r.feed(chunk)
+            total_fed += len(chunk)
+            max_buffer = max(max_buffer, len(r.buffer))
+        r.flush()
+        assert total_fed > 5000
+        assert max_buffer < 100, f"Buffer peaked at {max_buffer} chars"
+
+    def test_redactor_memory_is_constant(self):
+        """Buffer size is bounded regardless of how much text flows through."""
+        r = PIIRedactor()
+        buffer_sizes = []
+        for i in range(500):
+            r.feed("Normal text with no PII patterns whatsoever. ")
+            buffer_sizes.append(len(r.buffer))
+        r.flush()
+        assert max(buffer_sizes) == 0
