@@ -6,8 +6,9 @@ WINDOW_SECONDS = 60
 DB_PATH = "rate_limiter.db"
 
 
-async def init_db(db_path: str = DB_PATH):
+async def init_db(db_path: str | None = None):
     """Create the token_usage table if it doesn't exist."""
+    db_path = db_path or DB_PATH
     async with aiosqlite.connect(db_path) as db:
         await db.execute("""
             CREATE TABLE IF NOT EXISTS token_usage (
@@ -23,11 +24,12 @@ async def init_db(db_path: str = DB_PATH):
         await db.commit()
 
 
-async def check_rate_limit(api_key: str, requested_tokens: int, db_path: str = DB_PATH) -> tuple[bool, int]:
+async def check_rate_limit(api_key: str, requested_tokens: int, db_path: str | None = None) -> tuple[bool, int]:
     """Check if the request fits within the rate limit.
 
     Returns (allowed, remaining_tokens).
     """
+    db_path = db_path or DB_PATH
     now = time.time()
     window_start = now - WINDOW_SECONDS
 

@@ -1,12 +1,12 @@
-import asyncio
 import logging
 import sys
+from contextlib import asynccontextmanager
 
 import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
-from rate_limiter import check_rate_limit, init_db
+import rate_limiter
 
 logging.basicConfig(
     level=logging.INFO,
@@ -19,12 +19,13 @@ PRIMARY_URL = "http://localhost:8001"
 SECONDARY_URL = "http://localhost:8002"
 PRIMARY_TIMEOUT = 3.0  # seconds
 
-app = FastAPI(title="LLM Gateway Router")
 
+@asynccontextmanager
+async def lifespan(app):
+    await rate_limiter.init_db()
+    yield
 
-@app.on_event("startup")
-async def startup():
-    await init_db()
+app = FastAPI(title="LLM Gateway Router", lifespan=lifespan)
 
 
 def gateway_error(status_code: int, message: str) -> JSONResponse:
@@ -82,7 +83,7 @@ async def route_completion(request: Request):
 
     # Rate limit check
     estimated_tokens = estimate_tokens(body)
-    allowed, remaining = await check_rate_limit(api_key, estimated_tokens)
+    allowed, remaining = await rate_limiter.check_rate_limit(api_key, estimated_tokens)
     if not allowed:
         logger.warning("Rate limit exceeded for %s (remaining: %d)", api_key, remaining)
         return gateway_error(429, "Rate limit exceeded. Try again later.")

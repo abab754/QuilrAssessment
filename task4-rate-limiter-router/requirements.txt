@@ -1,0 +1,7 @@
+fastapi
+uvicorn
+httpx
+aiosqlite
+pytest
+anyio
+pytest-anyio
