@@ -275,3 +275,234 @@ class TestErrorSanitization:
         data = resp.json()
         assert resp.status_code == 400
         assert data["error"]["type"] == "gateway_error"
+
+
+# ============================================================
+# Evaluation Criteria Tests
+# ============================================================
+
+
+class TestAsyncConcurrencyAndTimeouts:
+    """Criterion 1: Async concurrency handling and timeout race conditions."""
+
+    @pytest.mark.anyio
+    async def test_concurrent_requests_different_tenants(self):
+        """Multiple tenants making concurrent requests should not interfere."""
+        import router
+        transport = ASGITransport(app=router.app)
+
+        async def make_call(api_key: str):
+            async with AsyncClient(transport=transport, base_url="http://test") as client:
+                return await client.post(
+                    "/v1/chat/completions",
+                    json=make_request(),
+                    headers={"Authorization": f"Bearer {api_key}"},
+                )
+
+        results = await asyncio.gather(
+            make_call("tenant-a"),
+            make_call("tenant-b"),
+            make_call("tenant-c"),
+        )
+        for resp in results:
+            assert resp.status_code == 200
+            assert resp.json()["model"] == "primary-model"
+
+    @pytest.mark.anyio
+    async def test_concurrent_requests_same_tenant_within_limit(self):
+        """Same tenant making concurrent requests that fit within the limit."""
+        import router
+        transport = ASGITransport(app=router.app)
+
+        async def make_call():
+            async with AsyncClient(transport=transport, base_url="http://test") as client:
+                return await client.post(
+                    "/v1/chat/completions",
+                    json=make_request("short"),
+                    headers=auth_header(),
+                )
+
+        results = await asyncio.gather(*[make_call() for _ in range(5)])
+        success_count = sum(1 for r in results if r.status_code == 200)
+        assert success_count >= 1
+
+    @pytest.mark.anyio
+    async def test_timeout_does_not_block_other_requests(self):
+        """A timing-out primary should not block a subsequent request."""
+        mock_providers.primary_timeout_seconds = 5
+        import router
+        transport = ASGITransport(app=router.app)
+
+        start = time.perf_counter()
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            resp = await client.post(
+                "/v1/chat/completions",
+                json=make_request(),
+                headers=auth_header(),
+                timeout=15.0,
+            )
+        elapsed = time.perf_counter() - start
+
+        assert resp.status_code == 200
+        assert resp.json()["model"] == "secondary-model"
+        assert elapsed < 4.5, f"Took {elapsed:.2f}s — timeout not enforced"
+
+    @pytest.mark.anyio
+    async def test_timeout_measured_in_seconds(self):
+        """Verify the timeout is actually ~3 seconds, not instant or way too long."""
+        mock_providers.primary_timeout_seconds = 10
+        import router
+        transport = ASGITransport(app=router.app)
+
+        start = time.perf_counter()
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            resp = await client.post(
+                "/v1/chat/completions",
+                json=make_request(),
+                headers=auth_header(),
+                timeout=15.0,
+            )
+        elapsed = time.perf_counter() - start
+
+        assert resp.json()["model"] == "secondary-model"
+        assert 2.5 < elapsed < 4.5, f"Elapsed {elapsed:.2f}s — expected ~3s timeout"
+
+
+class TestRateLimiterEvictionAndTracking:
+    """Criterion 2: Accurate rate-limiter state eviction and token tracking logic."""
+
+    @pytest.mark.anyio
+    async def test_eviction_removes_old_rows(self):
+        """After eviction, old rows should be gone from the database."""
+        import aiosqlite
+
+        async with aiosqlite.connect(TEST_DB) as db:
+            now = time.time()
+            await db.execute(
+                "INSERT INTO token_usage (api_key, tokens, timestamp) VALUES (?, ?, ?)",
+                ("key-a", 10_000, now - 120),
+            )
+            await db.execute(
+                "INSERT INTO token_usage (api_key, tokens, timestamp) VALUES (?, ?, ?)",
+                ("key-a", 5_000, now - 30),
+            )
+            await db.commit()
+
+        await check_rate_limit("key-a", 1, TEST_DB)
+
+        async with aiosqlite.connect(TEST_DB) as db:
+            cursor = await db.execute("SELECT COUNT(*) FROM token_usage WHERE api_key = 'key-a'")
+            row = await cursor.fetchone()
+            assert row[0] == 2
+
+    @pytest.mark.anyio
+    async def test_token_tracking_accuracy(self):
+        """Token counts should be tracked precisely across multiple requests."""
+        import aiosqlite
+
+        await check_rate_limit("key-a", 10_000, TEST_DB)
+        await check_rate_limit("key-a", 15_000, TEST_DB)
+        await check_rate_limit("key-a", 5_000, TEST_DB)
+
+        async with aiosqlite.connect(TEST_DB) as db:
+            cursor = await db.execute(
+                "SELECT SUM(tokens) FROM token_usage WHERE api_key = 'key-a'"
+            )
+            row = await cursor.fetchone()
+            assert row[0] == 30_000
+
+    @pytest.mark.anyio
+    async def test_rejected_request_not_recorded(self):
+        """A rejected request should NOT consume any of the budget."""
+        import aiosqlite
+
+        await check_rate_limit("key-a", 45_000, TEST_DB)
+        allowed, _ = await check_rate_limit("key-a", 10_000, TEST_DB)
+        assert allowed is False
+
+        async with aiosqlite.connect(TEST_DB) as db:
+            cursor = await db.execute(
+                "SELECT SUM(tokens) FROM token_usage WHERE api_key = 'key-a'"
+            )
+            row = await cursor.fetchone()
+            assert row[0] == 45_000
+
+    @pytest.mark.anyio
+    async def test_remaining_tokens_reported_accurately(self):
+        """The remaining token count should reflect exact usage."""
+        _, remaining1 = await check_rate_limit("key-a", 20_000, TEST_DB)
+        assert remaining1 == 30_000
+
+        _, remaining2 = await check_rate_limit("key-a", 10_000, TEST_DB)
+        assert remaining2 == 20_000
+
+        _, remaining3 = await check_rate_limit("key-a", 20_000, TEST_DB)
+        assert remaining3 == 0
+
+
+class TestFallbackAndErrorSanitization:
+    """Criterion 3: Graceful fallback mechanics and standardized error sanitization."""
+
+    @pytest.mark.anyio
+    async def test_fallback_response_is_valid(self):
+        """Fallback response should have the same structure as a primary response."""
+        mock_providers.primary_return_429 = True
+        import router
+        transport = ASGITransport(app=router.app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            resp = await client.post(
+                "/v1/chat/completions",
+                json=make_request(),
+                headers=auth_header(),
+            )
+        data = resp.json()
+        assert "choices" in data
+        assert "usage" in data
+        assert data["choices"][0]["message"]["role"] == "assistant"
+
+    @pytest.mark.anyio
+    async def test_all_error_responses_have_consistent_shape(self):
+        """Every error type should return the same {error: {type, message}} shape."""
+        import router
+        transport = ASGITransport(app=router.app)
+
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            r1 = await client.post("/v1/chat/completions", json=make_request())
+
+        for _ in range(10):
+            await check_rate_limit("tenant-err", 10_000, TEST_DB)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            r2 = await client.post(
+                "/v1/chat/completions",
+                json=make_request(),
+                headers={"Authorization": "Bearer tenant-err"},
+            )
+
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            r3 = await client.post(
+                "/v1/chat/completions",
+                content=b"bad",
+                headers={**auth_header(), "Content-Type": "application/json"},
+            )
+
+        for resp in [r1, r2, r3]:
+            data = resp.json()
+            assert "error" in data
+            assert data["error"]["type"] == "gateway_error"
+            assert "message" in data["error"]
+
+    @pytest.mark.anyio
+    async def test_upstream_error_details_never_exposed(self):
+        """Even when upstream fails, response must not contain internal details."""
+        mock_providers.primary_return_429 = True
+        import router
+        transport = ASGITransport(app=router.app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            resp = await client.post(
+                "/v1/chat/completions",
+                json=make_request(),
+                headers=auth_header(),
+            )
+        body = resp.text
+        assert "Traceback" not in body
+        assert "localhost:8001" not in body
