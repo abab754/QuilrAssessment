@@ -125,17 +125,12 @@ async def chat_completions(request: Request):
     body = await request.json()
     logger.info("Received chat completion request with %d messages", len(body.get("messages", [])))
 
-    client = httpx.AsyncClient()
-    upstream_response = await client.stream(
-        "POST", f"{UPSTREAM_URL}/v1/chat/completions", json=body
-    ).__aenter__()
-
     async def generate():
-        try:
-            async for chunk in stream_with_redaction(upstream_response):
-                yield chunk
-        finally:
-            await upstream_response.aclose()
-            await client.aclose()
+        async with httpx.AsyncClient() as client:
+            async with client.stream(
+                "POST", f"{UPSTREAM_URL}/v1/chat/completions", json=body
+            ) as upstream_response:
+                async for chunk in stream_with_redaction(upstream_response):
+                    yield chunk
 
     return StreamingResponse(generate(), media_type="text/event-stream")
